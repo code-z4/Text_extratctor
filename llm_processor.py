@@ -1,172 +1,209 @@
 """
 llm_processor.py — Call OpenRouter LLM to extract structured JSON from document text.
+Features: auto doc-type detection, confidence levels, evidence text, AI summary,
+          missing/unclear field identification, AI review suggestions.
 """
-
+ 
 import os
 import json
 import requests
-
-
 from dotenv import load_dotenv
+ 
 load_dotenv()
+ 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "deepseek/deepseek-r1"
-
-
+ 
 SCHEMA_BY_TYPE = {
-    "Invoice": {
-        "invoice_number": "string",
-        "invoice_date": "YYYY-MM-DD",
-        "due_date": "YYYY-MM-DD",
-        "vendor_name": "string",
-        "vendor_email": "string",
-        "vendor_phone": "string",
-        "vendor_address": "string",
-        "customer_name": "string",
-        "customer_email": "string",
-        "customer_address": "string",
-        "line_items": "[{description, quantity, unit_price, total}]",
-        "subtotal": "number",
-        "tax": "number",
-        "discount": "number",
-        "total_amount": "number",
-        "currency": "string",
-        "payment_terms": "string",
-        "notes": "string"
-    },
-    "Receipt": {
-        "receipt_number": "string",
-        "receipt_date": "YYYY-MM-DD",
-        "merchant_name": "string",
-        "merchant_address": "string",
-        "merchant_phone": "string",
-        "items_purchased": "[{item_name, quantity, price}]",
-        "subtotal": "number",
-        "tax": "number",
-        "total_amount": "number",
-        "payment_method": "string",
-        "currency": "string"
-    },
-    "Admission Form": {
-        "applicant_name": "string",
-        "date_of_birth": "YYYY-MM-DD",
-        "gender": "string",
-        "email": "string",
-        "phone_number": "string",
-        "address": "string",
-        "nationality": "string",
-        "program_applied": "string",
-        "academic_qualifications": "[{degree, institution, year, grade}]",
-        "application_date": "YYYY-MM-DD",
-        "application_id": "string",
-        "guardian_name": "string",
-        "guardian_contact": "string",
-        "documents_submitted": "[string]"
-    },
-    "Certificate": {
-        "certificate_type": "string",
-        "certificate_number": "string",
-        "recipient_name": "string",
-        "issue_date": "YYYY-MM-DD",
-        "expiry_date": "YYYY-MM-DD",
-        "issuing_authority": "string",
-        "issuer_name": "string",
-        "issuer_designation": "string",
-        "description": "string",
-        "awarded_for": "string",
-        "venue": "string"
-    },
-    "General Form": {
-        "form_title": "string",
-        "form_number": "string",
-        "submission_date": "YYYY-MM-DD",
-        "submitter_name": "string",
-        "submitter_email": "string",
-        "submitter_phone": "string",
-        "organization": "string",
-        "fields": "{key: value pairs of all form fields}",
-        "signature": "string",
-        "remarks": "string"
-    }
+    "Invoice": ["invoice_number", "invoice_date", "due_date", "vendor_name", "vendor_email",
+                "vendor_phone", "vendor_address", "customer_name", "customer_email",
+                "customer_address", "subtotal", "tax", "discount", "total_amount",
+                "currency", "payment_terms", "notes"],
+    "Receipt": ["receipt_number", "receipt_date", "merchant_name", "merchant_address",
+                "merchant_phone", "subtotal", "tax", "total_amount", "payment_method", "currency"],
+    "Admission Form": ["applicant_name", "date_of_birth", "gender", "email", "phone_number",
+                       "address", "nationality", "program_applied", "application_date",
+                       "application_id", "guardian_name", "guardian_contact"],
+    "Certificate": ["certificate_type", "certificate_number", "recipient_name", "issue_date",
+                    "expiry_date", "issuing_authority", "issuer_name", "issuer_designation",
+                    "description", "awarded_for", "venue"],
+    "General Form": ["form_title", "form_number", "submission_date", "submitter_name",
+                     "submitter_email", "submitter_phone", "organization", "signature", "remarks"]
 }
-
-
-def build_prompt(text: str, doc_type: str) -> str:
-    schema = SCHEMA_BY_TYPE.get(doc_type, SCHEMA_BY_TYPE["General Form"])
-    schema_str = json.dumps(schema, indent=2)
-
-    return f"""You are a precise document data extraction AI. Extract structured information from the document text below.
-
-Document Type: {doc_type}
-
-Extract ONLY the following fields (use null for any field not found in the document):
-{schema_str}
-
-Rules:
-- Return ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
-- Dates must be in YYYY-MM-DD format if found, otherwise null.
-- Monetary amounts must be numbers (not strings), e.g. 1500.00
-- Phone numbers should be in international format if possible.
-- Email addresses must be valid-looking strings.
-- For lists, return an empty array [] if no items found.
-
-Document Text:
-\"\"\"
-{text[:6000]}
-\"\"\"
-
-Respond with the JSON object only:"""
-
-
-def extract_structured_data(raw_text: str, doc_type: str) -> dict:
+ 
+ 
+def _call_llm(prompt: str, max_tokens: int = 2000) -> str | None:
     if not OPENROUTER_API_KEY:
-        return {"error": "OPENROUTER_API_KEY is not set in the .env file."}
-
-    prompt = build_prompt(raw_text, doc_type)
-
+        return None
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://doc-extractor.local",
         "X-Title": "Document Intelligence Extractor"
     }
-
     payload = {
         "model": MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_tokens": 2000
+        "max_tokens": max_tokens
     }
-
     try:
-        response = requests.post(OPENROUTER_BASE_URL, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-
-        content = data["choices"][0]["message"]["content"].strip()
-
-        # Strip markdown code fences if present
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.strip()
-        if content.endswith("```"):
-            content = content[:-3].strip()
-
-        return json.loads(content)
-
-    except requests.exceptions.Timeout:
-        return {"error": "Request to OpenRouter timed out. Please try again."}
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"OpenRouter API error: {e.response.status_code} — {e.response.text[:200]}"}
-    except json.JSONDecodeError as e:
-        return {"error": f"LLM returned invalid JSON: {str(e)}"}
+        resp = requests.post(OPENROUTER_BASE_URL, headers=headers, json=payload, timeout=90)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return {"error": str(e)}
+        return None
+ 
+ 
+def _parse_json(content: str) -> dict | list | None:
+    if not content:
+        return None
+    # Strip markdown fences
+    if "```" in content:
+        parts = content.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            try:
+                return json.loads(part)
+            except:
+                continue
+    try:
+        return json.loads(content)
+    except:
+        # Try to find JSON object/array in content
+        for start, end in [('{', '}'), ('[', ']')]:
+            s = content.find(start)
+            e = content.rfind(end)
+            if s != -1 and e != -1:
+                try:
+                    return json.loads(content[s:e+1])
+                except:
+                    pass
+    return None
+ 
+ 
+def detect_document_type(raw_text: str) -> str:
+    """Feature 1: Auto-detect document type from text."""
+    prompt = f"""Analyze the following document text and determine its type.
+Choose EXACTLY one from: Invoice, Receipt, Admission Form, Certificate, General Form
+ 
+Rules:
+- Return ONLY a JSON object with two keys: "doc_type" and "reasoning"
+- doc_type must be one of the five options above exactly
+- reasoning should be 1 sentence explaining why
+ 
+Document Text:
+\"\"\"
+{raw_text[:3000]}
+\"\"\"
+ 
+Respond with JSON only:"""
+ 
+    content = _call_llm(prompt, max_tokens=200)
+    result = _parse_json(content) if content else None
+    if result and "doc_type" in result:
+        doc_type = result["doc_type"]
+        if doc_type in SCHEMA_BY_TYPE:
+            return doc_type, result.get("reasoning", "")
+    return "General Form", "Could not determine document type automatically."
+ 
+ 
+def extract_structured_data(raw_text: str, doc_type: str) -> dict:
+    """Feature 2 & 3: Extract fields with confidence levels and evidence text."""
+    if not OPENROUTER_API_KEY:
+        return {"error": "OPENROUTER_API_KEY is not set in the .env file."}
+ 
+    fields = SCHEMA_BY_TYPE.get(doc_type, SCHEMA_BY_TYPE["General Form"])
+    fields_str = "\n".join(f'- "{f}"' for f in fields)
+ 
+    prompt = f"""You are a precise document data extraction AI.
+ 
+Document Type: {doc_type}
+ 
+Extract the following fields from the document text below.
+For EACH field, return a JSON object with:
+- "value": the extracted value (null if not found)
+- "confidence": "High", "Medium", or "Low"
+  * High = value is explicitly and clearly stated in text
+  * Medium = value is implied or partially stated
+  * Low = value is inferred or uncertain
+- "evidence": the exact short snippet of text (under 20 words) that supports this value, or null if not found
+ 
+Fields to extract:
+{fields_str}
+ 
+Additional rules:
+- Return ONLY a valid JSON object where each key is a field name and value is {{"value":..., "confidence":..., "evidence":...}}
+- Dates must be YYYY-MM-DD format
+- Monetary amounts must be numbers
+- No markdown fences, no explanation
+ 
+Document Text:
+\"\"\"
+{raw_text[:6000]}
+\"\"\"
+ 
+JSON response:"""
+ 
+    content = _call_llm(prompt, max_tokens=3000)
+    result = _parse_json(content)
+    if result is None:
+        return {"error": "LLM returned invalid JSON. Please try again."}
+    return result
+ 
+ 
+def generate_summary(raw_text: str, doc_type: str) -> str:
+    """Feature 4: Generate a short AI summary of the document."""
+    prompt = f"""You are a document analysis AI. Write a concise 2-3 sentence summary of the following {doc_type} document.
+Focus on the key parties involved, the main purpose, and any important amounts or dates.
+ 
+Document Text:
+\"\"\"
+{raw_text[:4000]}
+\"\"\"
+ 
+Summary (2-3 sentences only):"""
+ 
+    content = _call_llm(prompt, max_tokens=300)
+    return content if content else "Summary could not be generated."
+ 
+ 
+def analyze_fields(extracted: dict, doc_type: str, raw_text: str) -> dict:
+    """Features 5 & 6: Identify missing/unclear/incorrect fields and give AI review suggestions."""
+    if not OPENROUTER_API_KEY:
+        return {"missing": [], "unclear": [], "suggestions": []}
+ 
+    # Build a simplified view of extracted data for the prompt
+    simplified = {}
+    for k, v in extracted.items():
+        if isinstance(v, dict):
+            simplified[k] = {"value": v.get("value"), "confidence": v.get("confidence")}
+        else:
+            simplified[k] = v
+ 
+    prompt = f"""You are a document quality review AI analyzing a {doc_type}.
+ 
+Here are the extracted fields and their confidence levels:
+{json.dumps(simplified, indent=2)}
+ 
+Document text snippet:
+\"\"\"
+{raw_text[:3000]}
+\"\"\"
+ 
+Analyze the extraction and return a JSON object with exactly these three keys:
+1. "missing_fields": list of field names that are null/empty but should be present in this document type
+2. "unclear_fields": list of field names where the value exists but confidence is Low or the value seems incorrect
+3. "suggestions": list of specific, actionable suggestion strings to improve the document or extraction
+   (e.g. "Invoice number appears to be missing - check the top-right header of the document")
+ 
+Return ONLY valid JSON, no markdown fences:"""
+ 
+    content = _call_llm(prompt, max_tokens=1000)
+    result = _parse_json(content)
+    if result and all(k in result for k in ["missing_fields", "unclear_fields", "suggestions"]):
+        return result
+    return {"missing_fields": [], "unclear_fields": [], "suggestions": ["Could not generate analysis."]}
